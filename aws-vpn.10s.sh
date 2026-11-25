@@ -23,7 +23,7 @@ json_value() {
 
 profile_names() {
   local json name i=0
-  json=$("$VPN" list-profiles 2>/dev/null) || return 0
+  json=$("$VPN" list-profiles 2>/dev/null) || return 1
   while name=$(json_value "$json" "$i.profile-name"); do
     printf '%s\n' "$name"
     i=$((i + 1))
@@ -31,7 +31,7 @@ profile_names() {
 }
 
 profile_status() {
-  json_value "$("$VPN" get-connection-status --profile-name "$1" 2>/dev/null)" connection-status
+  json_value "$("$VPN" get-connection-status --profile-name="$1" 2>/dev/null)" connection-status
 }
 
 # list-connections leaves out a profile that is still connecting, so each
@@ -56,7 +56,7 @@ connected_profile() {
 disconnect_all() {
   local name
   while IFS= read -r name; do
-    [[ -n "$name" ]] && "$VPN" disconnect --profile-name "$name" >/dev/null 2>&1
+    [[ -n "$name" ]] && "$VPN" disconnect --profile-name="$name" >/dev/null 2>&1
   done < <(active_profiles)
   for _ in $(seq 20); do
     [[ -z "$(active_profiles)" ]] && return 0
@@ -97,14 +97,22 @@ notify() {
 # than the longest action is left over from one that was killed.
 action_running() {
   local started
-  started=$(cat "$BUSY_FILE" 2>/dev/null) || return 1
+  read -r started _ 2>/dev/null <"$BUSY_FILE" || return 1
   (($(date +%s) - started < 240))
 }
 
-begin_action() { date +%s >"$BUSY_FILE"; }
+begin_action() {
+  action_id="$(date +%s) $$"
+  printf '%s\n' "$action_id" >"$BUSY_FILE"
+}
+
+owns_action() { [[ "$(cat "$BUSY_FILE" 2>/dev/null)" == "$action_id" ]]; }
 
 end_action() {
-  connected_profile >"$LAST_FILE"
+  local now
+  now=$(connected_profile)
+  owns_action || return 0
+  printf '%s\n' "$now" >"$LAST_FILE"
   rm -f "$BUSY_FILE"
 }
 
@@ -112,8 +120,9 @@ end_action() {
 # through the browser sign-in, which the client allows up to 3 minutes for.
 wait_until_connected() {
   for _ in $(seq 180); do
-    [[ "$(profile_status "$1")" == "Connected" ]] && return 0
     sleep 1
+    [[ "$(profile_status "$1")" == "Connected" ]] && return 0
+    owns_action || return 0
   done
   return 1
 }
@@ -124,7 +133,7 @@ connect)
   profile_names | grep -Fxq -- "$target" || exit 1
   begin_action
   disconnect_all
-  if ! "$VPN" connect --profile-name "$target" >/dev/null 2>&1; then
+  if ! "$VPN" connect --profile-name="$target" >/dev/null 2>&1; then
     notify "VPN didn't connect" "aws-vpn-client couldn't start connecting to $target."
   else
     refresh_menu_bar
@@ -132,7 +141,6 @@ connect)
       notify "VPN didn't connect" "$target isn't connected after 3 minutes. The sign-in may have been closed or failed."
   fi
   end_action
-  refresh_menu_bar
   exit 0
   ;;
 disconnect)
@@ -150,12 +158,14 @@ if ! command -v "$VPN" >/dev/null 2>&1; then
   exit 0
 fi
 
-profiles=$(profile_names)
+read_failed=""
+profiles=$(profile_names) || read_failed=1
 current=""
 status=""
 while IFS= read -r profile; do
   [[ -z "$profile" ]] && continue
   profile_state=$(profile_status "$profile")
+  [[ -z "$profile_state" ]] && read_failed=1
   if [[ -n "$profile_state" && "$profile_state" != "NotConnected" ]]; then
     current=$profile
     status=$profile_state
@@ -166,7 +176,7 @@ shown_current=${current//|/¦}
 
 # Announce changes made outside the menu: from a terminal, the AWS app, or a
 # dropped session. A connect still in progress is not a settled state yet.
-if [[ -z "$current" || "$status" == "Connected" ]] && ! action_running; then
+if [[ -z "$read_failed" ]] && [[ -z "$current" || "$status" == "Connected" ]] && ! action_running; then
   now=""
   [[ "$status" == "Connected" ]] && now=$current
   if [[ -f "$LAST_FILE" ]]; then
